@@ -1,7 +1,6 @@
 import argparse
-import json
 from tqdm.auto import tqdm
-import whisper
+import mlx_whisper
 from pathlib import Path
 import subprocess
 from utils import ask_llm, split_srt
@@ -34,9 +33,6 @@ def video2audio(video, todir=None) -> str | Path:
     if not todir.exists():
         todir.mkdir(parents=True)
     tofile = todir / f"{Path(video).stem}.mp3"
-    if tofile.exists():
-        logger.warning(f"Audio file {tofile} already exists, skipping conversion.")
-        return tofile
     command = ["ffmpeg", "-y", "-i", video, "-q:a", "0", "-map", "a", str(tofile)]
     print(command)
     result = subprocess.run(command, capture_output=False, text=True)
@@ -47,73 +43,31 @@ def video2audio(video, todir=None) -> str | Path:
 
 def stt(audio, lang=None, todir=None) -> str | Path:
     todir = Path(todir if todir else Path(audio).parent)
-    tofile = todir / f"{Path(audio).stem}_transcription.json"
-    if tofile.exists():
-        logger.warning(
-            f"Transcription file {tofile} already exists, skipping transcription."
-        )
-        return tofile
-    result = model.transcribe(str(audio), word_timestamps=False, language=lang)
-    # writer = whisper.utils.WriteSRT(todir)  # type: ignore
-    # with open(tofile, "w", encoding="utf8") as f:
-    #     writer.write_result(result, f)
+    tofile = todir / f"{Path(audio).stem}.srt"
+    result = mlx_whisper.transcribe(
+        str(audio), word_timestamps=True, language=lang, path_or_hf_repo=args.stt_model
+    )
+    writer = whisper.utils.WriteSRT(todir)
     with open(tofile, "w", encoding="utf8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=4)
+        writer.write_result(result, f)
     return tofile
 
 
-def translate(transcribe_res_file, tgtlang="中文", model="gpt-4o", timeout=5 * 60):
-    tofile = (
-        Path(transcribe_res_file).parent
-        / f"{Path(transcribe_res_file).stem}_{tgtlang}.srt"
-    )
-    if tofile.exists():
-        logger.warning(
-            f"Translated SRT file {tofile} already exists, skipping translation."
-        )
-        return tofile
-    # translated_chunks = []
-    # for chunk in tqdm(split_srt(srt)):
-    #     translated = ask_llm(chunk, tgtlang=tgtlang, model=model, timeout=timeout)
-    #     translated_chunks.append(translated)
-    # translated = "\n\n".join(translated_chunks)
-    with open(transcribe_res_file, "r", encoding="utf8") as f:
-        transcribe_res = json.load(f)
-    index2span = {
-        item["id"]: {
-            "start": whisper.utils.format_timestamp(
-                float(item["start"]), always_include_hours=True, decimal_marker=","
-            ),
-            "end": whisper.utils.format_timestamp(
-                float(item["end"]), always_include_hours=True, decimal_marker=","
-            ),
-        }
-        for item in transcribe_res["segments"]
-    }
-    translated = ask_llm(transcribe_res, tgtlang=tgtlang, model=model, timeout=timeout)
-    # translated = [(item.index, item.translation) for item in translated.translations]
-    segments = []
-    for item in translated.translations:
-        if item.index not in index2span:
-            logger.warning(f"Index {item.index} not found in transcribe_res.")
-            continue
-        span = index2span[item.index]
-        segments.append(
-            f"{item.index}\n{span['start']} --> {span['end']}\n{item.translation.strip()}"
-        )
-    srt_content = "\n\n".join(segments)
-    tofile.write_text(srt_content, encoding="utf8")
+def translate(srt, tgtlang="中文", model="gpt-4o", timeout=5 * 60):
+    translated_chunks = []
+    for chunk in tqdm(split_srt(srt)):
+        translated = ask_llm(chunk, tgtlang=tgtlang, model=model, timeout=timeout)
+        translated_chunks.append(translated)
+    translated = "\n\n".join(translated_chunks)
+    tofile = Path(srt).parent / f"{Path(srt).stem}_{tgtlang}.srt"
+    tofile.write_text(translated, encoding="utf8")
     return str(tofile)
 
 
 def adjust_srt(srt, maxlen=28):
     blocks = []
     for block in Path(srt).read_text(encoding="utf8").split("\n\n"):
-        try:
-            num, timerange, text = block.split("\n")
-        except ValueError as e:
-            logger.warning(f"Found malformed block: {block!r}")
-            raise e
+        num, timerange, text = block.split("\n")
         if len(text) > maxlen:
             text = "\n".join(
                 [text[i : i + maxlen] for i in range(0, len(text), maxlen)]
@@ -184,12 +138,11 @@ if __name__ == "__main__":
     args = parse_args()
     if not args.srt:
         if args.stt_model == "small":
-            modelpath = "stt_models/whisper/small.pt"
+            modelpath = "mlx-community/whisper-small-mlx"
         elif args.stt_model == "small.en":
-            modelpath = "stt_models/whisper/small.en.pt"
+            modelpath = "mlx-community/whisper-small.en-mlx"
         else:
             raise ValueError(
                 f"Invalid {args.stt_model=}, please choose one from ['small', 'small.en']."
             )
-        model = whisper.load_model(modelpath)
     main(args.video, args.lang, args.todir, args.srt, args.tgtlang, args.trans_model)
