@@ -1,3 +1,4 @@
+import sys
 import argparse
 import json
 from tqdm.auto import tqdm
@@ -16,12 +17,17 @@ def parse_args():
     )
     parser.add_argument("video", help="The video file.")
     parser.add_argument("--lang", help="The main language in video.")
-    parser.add_argument("--todir", default="/data/", help="The result video dir.")
+    parser.add_argument("--todir", default="../data/", help="The result video dir.")
     parser.add_argument("--stt_model", default="small", help="The STT model.")
     parser.add_argument("--srt", help="The SRT file.")
     parser.add_argument("--tgtlang", default="中文", help="Translate to which lang.")
     parser.add_argument(
         "--trans_model", default="gpt-4o", help="The translation model."
+    )
+    parser.add_argument(
+        "--soft-sub",
+        action="store_true",
+        help="Use soft subtitles (mov_text) instead of burning them into video. Default is burn-in for better compatibility.",
     )
     return parser.parse_args()
 
@@ -125,24 +131,61 @@ def adjust_srt(srt, maxlen=28):
     return str(tofile)
 
 
-def merge(video, srt, todir=None) -> str | Path:
+def merge(video, srt, todir=None, burn_in=True) -> str | Path:
+    """
+    Merge video with subtitles.
+    
+    Args:
+        video: Input video file path
+        srt: SRT subtitle file path
+        todir: Output directory
+        burn_in: If True, burn subtitles into video (hardcoded, compatible with all players).
+                 If False, use soft subtitles (mov_text, may not work on all devices).
+    """
     if not Path(video).exists() or not Path(srt).exists():
         raise FileNotFoundError
     todir = Path(todir if todir else Path(video).parent)
     tofile = todir / f"{Path(video).stem}_sub.mp4"
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        video,
-        "-i",
-        srt,
-        "-c",
-        "copy",
-        "-c:s",
-        "mov_text",
-        str(tofile),
-    ]
+    
+    if burn_in:
+        # Burn-in subtitles (hardcoded) - compatible with all players
+        # Need to escape special characters in path for ffmpeg filter
+        srt_escaped = str(Path(srt).absolute()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video,
+            "-vf",
+            f"subtitles='{srt_escaped}':force_style='FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2'",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(tofile),
+        ]
+    else:
+        # Soft subtitles (mov_text) - may not work on all devices
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video,
+            "-i",
+            srt,
+            "-c",
+            "copy",
+            "-c:s",
+            "mov_text",
+            str(tofile),
+        ]
+    
     print(command)
     result = subprocess.run(command, capture_output=False, text=True)
     if result.returncode == 0:
@@ -153,7 +196,7 @@ def merge(video, srt, todir=None) -> str | Path:
 
 
 def main(
-    video, lang=None, todir=None, srt=None, tgtlang=True, trans_model="gpt-4o"
+    video, lang=None, todir=None, srt=None, tgtlang=True, trans_model="gpt-4o", burn_in=True
 ) -> str | Path:
     if not srt:
         logger.info(f"Start video2audio")
@@ -175,7 +218,7 @@ def main(
     logger.info(f"Done adjust, {time.time() - s:.4f} s.")
     logger.info(f"Start merge")
     s = time.time()
-    result_video = merge(video, srt, todir=todir)
+    result_video = merge(video, srt, todir=todir, burn_in=burn_in)
     logger.info(f"Done merge, {time.time() - s:.4f} s.")
     return result_video
 
@@ -187,9 +230,14 @@ if __name__ == "__main__":
             modelpath = "stt_models/whisper/small.pt"
         elif args.stt_model == "small.en":
             modelpath = "stt_models/whisper/small.en.pt"
+        elif args.stt_model == 'turbo':
+            modelpath = 'turbo'
         else:
             raise ValueError(
                 f"Invalid {args.stt_model=}, please choose one from ['small', 'small.en']."
             )
-        model = whisper.load_model(modelpath)
-    main(args.video, args.lang, args.todir, args.srt, args.tgtlang, args.trans_model)
+        device = None
+        if sys.platform == 'darwin':
+            device = 'mps'
+        model = whisper.load_model(modelpath, device=device)
+    main(args.video, args.lang, args.todir, args.srt, args.tgtlang, args.trans_model, burn_in=not args.soft_sub)
