@@ -68,6 +68,35 @@ def stt(audio, lang=None, todir=None) -> str | Path:
     return tofile
 
 
+def save_original_srt(transcribe_res_file):
+    """Save the original language SRT subtitle file from transcription JSON."""
+    tofile = Path(transcribe_res_file).parent / f"{Path(transcribe_res_file).stem}.srt"
+    if tofile.exists():
+        logger.warning(
+            f"Original SRT file {tofile} already exists, skipping generation."
+        )
+        return str(tofile)
+
+    with open(transcribe_res_file, "r", encoding="utf8") as f:
+        transcribe_res = json.load(f)
+
+    segments = []
+    for item in transcribe_res["segments"]:
+        start = whisper.utils.format_timestamp(
+            float(item["start"]), always_include_hours=True, decimal_marker=","
+        )
+        end = whisper.utils.format_timestamp(
+            float(item["end"]), always_include_hours=True, decimal_marker=","
+        )
+        text = item["text"].strip()
+        segments.append(f"{item['id']}\n{start} --> {end}\n{text}")
+
+    srt_content = "\n\n".join(segments)
+    tofile.write_text(srt_content, encoding="utf8")
+    logger.info(f"Saved original SRT file: {tofile}")
+    return str(tofile)
+
+
 def translate(transcribe_res_file, tgtlang="中文", model="gpt-4o", timeout=5 * 60):
     tofile = (
         Path(transcribe_res_file).parent
@@ -78,15 +107,15 @@ def translate(transcribe_res_file, tgtlang="中文", model="gpt-4o", timeout=5 *
             f"Translated SRT file {tofile} already exists, skipping translation."
         )
         return tofile
-    # translated_chunks = []
-    # for chunk in tqdm(split_srt(srt)):
-    #     translated = ask_llm(chunk, tgtlang=tgtlang, model=model, timeout=timeout)
-    #     translated_chunks.append(translated)
-    # translated = "\n\n".join(translated_chunks)
     with open(transcribe_res_file, "r", encoding="utf8") as f:
         transcribe_res = json.load(f)
-    index2span = {
-        item["id"]: {
+    
+    # Build index to span and text mapping
+    index2span = {}
+    index2text = {}
+    for item in transcribe_res["segments"]:
+        idx = item["id"]
+        index2span[idx] = {
             "start": whisper.utils.format_timestamp(
                 float(item["start"]), always_include_hours=True, decimal_marker=","
             ),
@@ -94,21 +123,38 @@ def translate(transcribe_res_file, tgtlang="中文", model="gpt-4o", timeout=5 *
                 float(item["end"]), always_include_hours=True, decimal_marker=","
             ),
         }
-        for item in transcribe_res["segments"]
-    }
+        index2text[idx] = item["text"].strip()
+    
     translated = ask_llm(transcribe_res, tgtlang=tgtlang, model=model, timeout=timeout)
-    # translated = [(item.index, item.translation) for item in translated.translations]
+    
+    # Build translation map for quick lookup
+    translation_map = {item.index: item.translation.strip() for item in translated.translations}
+    
+    # Check for missing translations
+    all_ids = set(index2span.keys())
+    translated_ids = set(translation_map.keys())
+    missing_ids = all_ids - translated_ids
+    
+    if missing_ids:
+        logger.warning(f"Missing {len(missing_ids)} translations: {sorted(missing_ids)}")
+        logger.warning("Using original text as fallback for missing translations.")
+    
+    # Generate SRT with all segments, using fallback for missing ones
     segments = []
-    for item in translated.translations:
-        if item.index not in index2span:
-            logger.warning(f"Index {item.index} not found in transcribe_res.")
-            continue
-        span = index2span[item.index]
-        segments.append(
-            f"{item.index}\n{span['start']} --> {span['end']}\n{item.translation.strip()}"
-        )
+    for idx in sorted(index2span.keys()):
+        span = index2span[idx]
+        if idx in translation_map:
+            text = translation_map[idx]
+        else:
+            # Fallback to original text with a marker
+            text = f"[未翻译] {index2text[idx]}"
+            logger.debug(f"Using fallback for index {idx}: {index2text[idx][:50]}...")
+        segments.append(f"{idx}\n{span['start']} --> {span['end']}\n{text}")
+    
     srt_content = "\n\n".join(segments)
     tofile.write_text(srt_content, encoding="utf8")
+    
+    logger.info(f"Translated {len(translated_ids)}/{len(all_ids)} segments, {len(missing_ids)} fallbacks used.")
     return str(tofile)
 
 
@@ -131,16 +177,17 @@ def adjust_srt(srt, maxlen=28):
     return str(tofile)
 
 
-def merge(video, srt, todir=None, burn_in=True) -> str | Path:
+def merge(video, srt, todir=None, burn_in=True, original_srt=None) -> str | Path:
     """
     Merge video with subtitles.
 
     Args:
         video: Input video file path
-        srt: SRT subtitle file path
+        srt: SRT subtitle file path (translated)
         todir: Output directory
         burn_in: If True, burn subtitles into video (hardcoded, compatible with all players).
                  If False, use soft subtitles (mov_text, may not work on all devices).
+        original_srt: Optional original language SRT file to add as second subtitle track
     """
     if not Path(video).exists() or not Path(srt).exists():
         raise FileNotFoundError
@@ -177,21 +224,55 @@ def merge(video, srt, todir=None, burn_in=True) -> str | Path:
         ]
     else:
         # Soft subtitles (mov_text) - may not work on all devices
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video,
-            "-i",
-            srt,
-            "-c",
-            "copy",
-            "-c:s",
-            "mov_text",
-            "-metadata:s:s:0",
-            "language=chi",
-            str(tofile),
-        ]
+        # Add both translated and original subtitles as separate tracks
+        if original_srt and Path(original_srt).exists():
+            command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video,
+                "-i",
+                srt,
+                "-i",
+                original_srt,
+                "-c",
+                "copy",
+                "-c:s",
+                "mov_text",
+                "-map",
+                "0:v",
+                "-map",
+                "0:a",
+                "-map",
+                "1:s",
+                "-map",
+                "2:s",
+                "-metadata:s:s:0",
+                "language=chi",
+                "-metadata:s:s:0",
+                "title=Chinese",
+                "-metadata:s:s:1",
+                "language=eng",
+                "-metadata:s:s:1",
+                "title=English",
+                str(tofile),
+            ]
+        else:
+            command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video,
+                "-i",
+                srt,
+                "-c",
+                "copy",
+                "-c:s",
+                "mov_text",
+                "-metadata:s:s:0",
+                "language=chi",
+                str(tofile),
+            ]
 
     print(command)
     result = subprocess.run(command, capture_output=False, text=True)
@@ -211,6 +292,7 @@ def main(
     trans_model="gpt-4o",
     burn_in=True,
 ) -> str | Path:
+    original_srt = None
     if not srt:
         logger.info(f"Start video2audio")
         s = time.time()
@@ -218,12 +300,23 @@ def main(
         logger.info(f"Done video2audio, {time.time() - s:.4f} s.")
         logger.info(f"Start stt")
         s = time.time()
-        srt = stt(audio, lang=lang, todir=todir)
+        transcribe_res = stt(audio, lang=lang, todir=todir)
         logger.info(f"Done stt, {time.time() - s:.4f} s.")
+        # Save original language SRT
+        logger.info(f"Start save_original_srt")
+        s = time.time()
+        original_srt = save_original_srt(transcribe_res)
+        logger.info(f"Done save_original_srt, {time.time() - s:.4f} s.")
+    else:
+        transcribe_res = srt
+        # Try to find original SRT if it exists
+        original_srt_path = Path(srt).parent / f"{Path(srt).stem.replace('_transcription', '')}_transcription.srt"
+        if original_srt_path.exists():
+            original_srt = str(original_srt_path)
     if tgtlang:
         logger.info(f"Start translate")
         s = time.time()
-        srt = translate(srt, tgtlang=tgtlang, model=trans_model)
+        srt = translate(transcribe_res, tgtlang=tgtlang, model=trans_model)
         logger.info(f"Done translate, {time.time() - s:.4f} s.")
     logger.info(f"Start adjust")
     s = time.time()
@@ -231,7 +324,7 @@ def main(
     logger.info(f"Done adjust, {time.time() - s:.4f} s.")
     logger.info(f"Start merge")
     s = time.time()
-    result_video = merge(video, srt, todir=todir, burn_in=burn_in)
+    result_video = merge(video, srt, todir=todir, burn_in=burn_in, original_srt=original_srt)
     logger.info(f"Done merge, {time.time() - s:.4f} s.")
     return result_video
 
