@@ -134,7 +134,7 @@ def adjust_srt(srt, maxlen=28):
 def merge(video, srt, todir=None, burn_in=True) -> str | Path:
     """
     Merge video with subtitles.
-    
+
     Args:
         video: Input video file path
         srt: SRT subtitle file path
@@ -146,11 +146,16 @@ def merge(video, srt, todir=None, burn_in=True) -> str | Path:
         raise FileNotFoundError
     todir = Path(todir if todir else Path(video).parent)
     tofile = todir / f"{Path(video).stem}_sub.mp4"
-    
+
     if burn_in:
         # Burn-in subtitles (hardcoded) - compatible with all players
         # Need to escape special characters in path for ffmpeg filter
-        srt_escaped = str(Path(srt).absolute()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        srt_escaped = (
+            str(Path(srt).absolute())
+            .replace("\\", "\\\\")
+            .replace(":", "\\:")
+            .replace("'", "\\'")
+        )
         command = [
             "ffmpeg",
             "-y",
@@ -183,9 +188,11 @@ def merge(video, srt, todir=None, burn_in=True) -> str | Path:
             "copy",
             "-c:s",
             "mov_text",
+            "-metadata:s:s:0",
+            "language=chi",
             str(tofile),
         ]
-    
+
     print(command)
     result = subprocess.run(command, capture_output=False, text=True)
     if result.returncode == 0:
@@ -196,7 +203,13 @@ def merge(video, srt, todir=None, burn_in=True) -> str | Path:
 
 
 def main(
-    video, lang=None, todir=None, srt=None, tgtlang=True, trans_model="gpt-4o", burn_in=True
+    video,
+    lang=None,
+    todir=None,
+    srt=None,
+    tgtlang=True,
+    trans_model="gpt-4o",
+    burn_in=True,
 ) -> str | Path:
     if not srt:
         logger.info(f"Start video2audio")
@@ -230,14 +243,23 @@ if __name__ == "__main__":
             modelpath = "stt_models/whisper/small.pt"
         elif args.stt_model == "small.en":
             modelpath = "stt_models/whisper/small.en.pt"
-        elif args.stt_model == 'turbo':
-            modelpath = 'turbo'
+        elif args.stt_model == "turbo":
+            modelpath = "turbo"
         else:
-            raise ValueError(
-                f"Invalid {args.stt_model=}, please choose one from ['small', 'small.en']."
-            )
+            modelpath = args.stt_model
         device = None
-        if sys.platform == 'darwin':
-            device = 'mps'
+        if sys.platform == "darwin":
+            device = "mps"
         model = whisper.load_model(modelpath, device=device)
-    main(args.video, args.lang, args.todir, args.srt, args.tgtlang, args.trans_model, burn_in=not args.soft_sub)
+        logger.info(
+            f"Loaded STT model {args.stt_model} from {modelpath}, device={device}."
+        )
+    main(
+        args.video,
+        args.lang,
+        args.todir,
+        args.srt,
+        args.tgtlang,
+        args.trans_model,
+        burn_in=not args.soft_sub,
+    )
