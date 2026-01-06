@@ -10,6 +10,8 @@
 
 ## 使用
 
+将 `.env.example` 重命名为 `.env`，并更新里面的 env。
+
 ```bash
 usage: main.py [-h] [--lang LANG] [--todir TODIR] [--stt_model STT_MODEL] [--srt SRT] [--tgtlang TGTLANG] [--trans_model TRANS_MODEL] video
 
