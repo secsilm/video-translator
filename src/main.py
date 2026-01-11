@@ -616,22 +616,123 @@ def translate(transcribe_res_file, tgtlang="中文", model="gpt-4o", timeout=5 *
     return str(tofile)
 
 
-def adjust_srt(srt, maxlen=28):
+def split_multi_sentence_subtitle(num, timerange, text, min_duration=5.0, min_chars=8, min_split_duration=2.0):
+    """
+    Split a subtitle containing multiple sentences into separate subtitles.
+    Only splits if conditions are met (conservative approach).
+    
+    Args:
+        min_duration: Minimum total duration to consider splitting
+        min_chars: Minimum characters per sentence to split
+        min_split_duration: Minimum duration for each part after split
+    
+    Returns a list of (num, timerange, text) tuples.
+    """
+    # Parse time range
+    start_str, end_str = timerange.split(" --> ")
+    
+    def parse_time(t):
+        h, m, rest = t.split(":")
+        s, ms = rest.split(",")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+    
+    def format_time(seconds):
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        ms = int((seconds % 1) * 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    
+    start = parse_time(start_str)
+    end = parse_time(end_str)
+    duration = end - start
+    
+    # Only split if duration is long enough
+    if duration < min_duration:
+        return [(num, timerange, text)]
+    
+    # Find sentence boundaries (。!？)
+    # Look for sentence-ending punctuation followed by more content
+    sentences = []
+    current = ""
+    for i, char in enumerate(text):
+        current += char
+        if char in "。！？" and i < len(text) - 1:
+            sentences.append(current.strip())
+            current = ""
+    if current.strip():
+        sentences.append(current.strip())
+    
+    # Only split if we have exactly 2 sentences and both are long enough
+    if len(sentences) != 2:
+        return [(num, timerange, text)]
+    
+    if len(sentences[0]) < min_chars or len(sentences[1]) < min_chars:
+        return [(num, timerange, text)]
+    
+    # Allocate time proportionally based on character count
+    total_chars = len(sentences[0]) + len(sentences[1])
+    ratio = len(sentences[0]) / total_chars
+    
+    mid_time = start + duration * ratio
+    
+    # Check if both parts would have enough duration
+    first_duration = mid_time - start
+    second_duration = end - mid_time
+    if first_duration < min_split_duration or second_duration < min_split_duration:
+        return [(num, timerange, text)]
+    
+    # Create two subtitles
+    result = [
+        (num, f"{start_str} --> {format_time(mid_time)}", sentences[0]),
+        (f"{num}b", f"{format_time(mid_time)} --> {end_str}", sentences[1]),
+    ]
+    
+    return result
+
+
+def adjust_srt(srt, maxlen=28, split_sentences=True):
     blocks = []
+    split_count = 0
     for block in Path(srt).read_text(encoding="utf8").split("\n\n"):
         try:
             num, timerange, text = block.split("\n")
         except ValueError as e:
             logger.warning(f"Found malformed block: {block!r}")
             raise e
-        if len(text) > maxlen:
-            text = "\n".join(
-                [text[i : i + maxlen] for i in range(0, len(text), maxlen)]
-            )
-        text = text.strip("。，").strip()
-        blocks.append("\n".join([num, timerange, text]))
+        
+        # Try to split multi-sentence subtitles
+        if split_sentences:
+            split_results = split_multi_sentence_subtitle(num, timerange, text)
+            if len(split_results) > 1:
+                split_count += 1
+            for sub_num, sub_timerange, sub_text in split_results:
+                if len(sub_text) > maxlen:
+                    sub_text = "\n".join(
+                        [sub_text[i : i + maxlen] for i in range(0, len(sub_text), maxlen)]
+                    )
+                sub_text = sub_text.strip("。，").strip()
+                blocks.append("\n".join([str(sub_num), sub_timerange, sub_text]))
+        else:
+            if len(text) > maxlen:
+                text = "\n".join(
+                    [text[i : i + maxlen] for i in range(0, len(text), maxlen)]
+                )
+            text = text.strip("。，").strip()
+            blocks.append("\n".join([num, timerange, text]))
+    
+    # Re-number all blocks sequentially
+    final_blocks = []
+    for i, block in enumerate(blocks):
+        lines = block.split("\n")
+        lines[0] = str(i)
+        final_blocks.append("\n".join(lines))
+    
+    if split_count > 0:
+        logger.info(f"Split {split_count} multi-sentence subtitles.")
+    
     tofile = Path(srt).parent / f"{Path(srt).stem}_adjusted.srt"
-    tofile.write_text("\n\n".join(blocks), encoding="utf8")
+    tofile.write_text("\n\n".join(final_blocks), encoding="utf8")
     return str(tofile)
 
 
