@@ -156,6 +156,12 @@ def parse_args():
         dest="no_fix_timestamps",
         help="Disable automatic fixing of anomalous timestamps.",
     )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        dest="raw_mode",
+        help="Raw mode: skip all subtitle adjustments (no timestamp fixing, no merging, no filtering). Directly translate the original Whisper transcription.",
+    )
     return parser.parse_args()
 
 
@@ -207,6 +213,10 @@ def fix_timestamp_anomalies(transcribe_res_file, max_wps=5.0, min_wps=1.0):
     - Calculating expected duration based on typical speech rate
     - Moving the start time closer to the end time
     
+    IMPORTANT: If a segment continues directly from the previous segment (no gap),
+    we should NOT adjust its start time as this would create an artificial gap
+    and break sentence continuity.
+    
     Args:
         transcribe_res_file: Path to the transcription JSON file
         max_wps: Maximum expected words per second for normal speech
@@ -233,6 +243,7 @@ def fix_timestamp_anomalies(transcribe_res_file, max_wps=5.0, min_wps=1.0):
     # Target WPS for estimating correct duration (typical speech rate)
     target_wps = 2.5
     
+    prev_seg = None
     for seg in segments:
         duration = seg["end"] - seg["start"]
         text = seg["text"].strip()
@@ -240,12 +251,24 @@ def fix_timestamp_anomalies(transcribe_res_file, max_wps=5.0, min_wps=1.0):
         
         if duration < 0.1 or words == 0:
             fixed_segments.append(seg.copy())
+            prev_seg = seg
             continue
         
         wps = words / duration
         
+        # Check if this segment continues directly from the previous segment
+        # (i.e., starts exactly where or very close to where previous one ends)
+        is_continuation = False
+        if prev_seg is not None:
+            gap = seg["start"] - prev_seg["end"]
+            # Consider it a continuation if gap is less than 0.5 seconds
+            if gap < 0.5:
+                is_continuation = True
+        
         # Check if timing is anomalous (WPS too low = duration too long for text)
-        if wps < min_wps and duration > 5:
+        # BUT don't adjust if this segment is a continuation from previous
+        # (adjusting would create an artificial gap and break sentence flow)
+        if wps < min_wps and duration > 5 and not is_continuation:
             # Calculate expected duration based on typical speech rate
             expected_duration = words / target_wps
             expected_duration = max(expected_duration, 1.0)  # At least 1 second
@@ -266,7 +289,14 @@ def fix_timestamp_anomalies(transcribe_res_file, max_wps=5.0, min_wps=1.0):
                 f"- \"{text[:40]}...\""
             )
         else:
+            if wps < min_wps and duration > 5 and is_continuation:
+                logger.debug(
+                    f"Skipping timestamp fix for continuation segment [{seg['id']}]: "
+                    f"'{text[:30]}...' (would break sentence flow)"
+                )
             fixed_segments.append(seg.copy())
+        
+        prev_seg = seg
     
     # Create fixed result
     fixed_result = {
@@ -474,11 +504,33 @@ def merge_short_segments(transcribe_res_file, min_words=3, min_duration=1.0, max
             hard_max_duration = 7.0   # Absolute max duration regardless of conditions
             hard_max_words = 20       # Absolute max words regardless of conditions
             
+            # For incomplete sentences with short continuations, we want to merge the text
+            # but NOT extend the end time to the full next segment's end time
+            # (which might be excessively long due to Whisper timing errors)
+            short_continuation = is_incomplete and word_count <= 3
+            
             if is_incomplete:
                 # For incomplete sentences, only slightly relaxed limits
                 soft_max_duration = min(max_duration * 1.05, hard_max_duration)
                 soft_max_words = min(int(max_words * 1.05), hard_max_words)
-                if potential_duration > soft_max_duration or potential_word_count > soft_max_words:
+                
+                if short_continuation and potential_word_count <= soft_max_words:
+                    # Short continuation (1-3 words) - merge but with adjusted end time
+                    # Calculate a reasonable end time based on the additional words
+                    # Typical speech rate: ~2.5 words/second
+                    additional_duration = word_count / 2.5
+                    new_end = current_segment["end"] + additional_duration
+                    # Don't exceed the actual next segment's end time
+                    new_end = min(new_end, segment["end"])
+                    
+                    current_segment["text"] = current_text + " " + text
+                    current_segment["end"] = new_end
+                    logger.info(
+                        f"Merged short continuation '{text}' into previous segment "
+                        f"(adjusted end: {current_segment['end']:.2f}s instead of {segment['end']:.2f}s)"
+                    )
+                    continue  # Move to next segment without starting a new current_segment
+                elif potential_duration > soft_max_duration or potential_word_count > soft_max_words:
                     should_merge = False
                     logger.debug(f"Incomplete sentence not merged due to length: {current_text[:50]}...")
             else:
@@ -487,7 +539,8 @@ def merge_short_segments(transcribe_res_file, min_words=3, min_duration=1.0, max
             
             # Don't merge if there's a long gap between segments (> 1.5 seconds)
             gap = segment["start"] - current_segment["end"]
-            if gap > 1.5:
+            gap_too_large = gap > 1.5
+            if gap_too_large:
                 should_merge = False
             
             if should_merge:
@@ -495,6 +548,62 @@ def merge_short_segments(transcribe_res_file, min_words=3, min_duration=1.0, max
                 current_segment["end"] = segment["end"]
                 current_segment["text"] = current_text + " " + text
             else:
+                # Handle incomplete sentences that can't be merged due to time gap
+                # When current segment ends with incomplete sentence but gap is too large:
+                # 1. Pull the continuation text from next segment into current segment
+                # 2. Extend current segment's end time to cover the continuation
+                # This ensures the incomplete sentence is completed before a long gap
+                if is_incomplete and gap_too_large:
+                    # Find where the sentence ends in the next segment
+                    # Look for sentence-ending punctuation in the next segment's text
+                    sentence_end_match = re.search(r'^([^.!?]*[.!?])', text)
+                    if sentence_end_match:
+                        # Extract the sentence completion from next segment
+                        sentence_completion = sentence_end_match.group(1).strip()
+                        remaining_text = text[len(sentence_end_match.group(1)):].strip()
+                        
+                        # Add completion to current segment and extend its end time
+                        # The end time should be proportional to where we split the text
+                        if remaining_text:
+                            # Calculate proportional end time based on text split
+                            completion_ratio = len(sentence_completion) / len(text)
+                            new_end = segment["start"] + duration * completion_ratio
+                            # Ensure minimum duration for the completion
+                            new_end = max(new_end, segment["start"] + 0.5)
+                        else:
+                            # All text goes to current segment
+                            new_end = segment["end"]
+                        
+                        current_segment["text"] = current_text + " " + sentence_completion
+                        current_segment["end"] = new_end
+                        merged_segments.append(current_segment)
+                        
+                        logger.info(
+                            f"Bridged incomplete sentence across gap: "
+                            f"'{current_text[-30:]}' + '{sentence_completion}' "
+                            f"(gap: {gap:.1f}s)"
+                        )
+                        
+                        # Start new segment with remaining text if any
+                        if remaining_text:
+                            current_segment = {
+                                "id": len(merged_segments),
+                                "start": new_end,
+                                "end": segment["end"],
+                                "text": remaining_text,
+                            }
+                        else:
+                            current_segment = None
+                        continue
+                    else:
+                        # No sentence ending found - extend current segment to bridge gap
+                        # The incomplete segment should display until next segment starts
+                        logger.warning(
+                            f"Extending incomplete segment to bridge gap: "
+                            f"'{current_text[-40:]}' (gap: {gap:.1f}s)"
+                        )
+                        current_segment["end"] = segment["start"] - 0.1  # Small buffer
+                
                 # Finalize current segment and start new one
                 merged_segments.append(current_segment)
                 current_segment = {
@@ -857,6 +966,7 @@ def main(
     max_workers=4,
     filter_segments=False,
     fix_timestamps=True,
+    raw_mode=False,
 ) -> str | Path:
     original_srt = None
     if not srt:
@@ -868,29 +978,34 @@ def main(
         s = time.time()
         transcribe_res = stt(audio, lang=lang, todir=todir)
         logger.info(f"Done stt, {time.time() - s:.4f} s.")
-        # Fix anomalous timestamps
-        if fix_timestamps:
-            logger.info(f"Start fix_timestamp_anomalies")
-            s = time.time()
-            transcribe_res = fix_timestamp_anomalies(transcribe_res)
-            logger.info(f"Done fix_timestamp_anomalies, {time.time() - s:.4f} s.")
-        # Filter anomalous segments (optional)
-        if filter_segments:
-            logger.info(f"Start filter_anomalous_segments")
-            s = time.time()
-            transcribe_res = filter_anomalous_segments(transcribe_res)
-            logger.info(f"Done filter_anomalous_segments, {time.time() - s:.4f} s.")
-        # Merge short segments
-        if merge_segments:
-            logger.info(f"Start merge_short_segments")
-            s = time.time()
-            transcribe_res = merge_short_segments(
-                transcribe_res,
-                min_words=min_words,
-                min_duration=min_duration,
-                max_duration=max_duration,
-            )
-            logger.info(f"Done merge_short_segments, {time.time() - s:.4f} s.")
+        
+        # Raw mode: skip all adjustments
+        if raw_mode:
+            logger.info("Raw mode enabled: skipping timestamp fixing, filtering, and merging.")
+        else:
+            # Fix anomalous timestamps
+            if fix_timestamps:
+                logger.info(f"Start fix_timestamp_anomalies")
+                s = time.time()
+                transcribe_res = fix_timestamp_anomalies(transcribe_res)
+                logger.info(f"Done fix_timestamp_anomalies, {time.time() - s:.4f} s.")
+            # Filter anomalous segments (optional)
+            if filter_segments:
+                logger.info(f"Start filter_anomalous_segments")
+                s = time.time()
+                transcribe_res = filter_anomalous_segments(transcribe_res)
+                logger.info(f"Done filter_anomalous_segments, {time.time() - s:.4f} s.")
+            # Merge short segments
+            if merge_segments:
+                logger.info(f"Start merge_short_segments")
+                s = time.time()
+                transcribe_res = merge_short_segments(
+                    transcribe_res,
+                    min_words=min_words,
+                    min_duration=min_duration,
+                    max_duration=max_duration,
+                )
+                logger.info(f"Done merge_short_segments, {time.time() - s:.4f} s.")
         # Save original language SRT
         logger.info(f"Start save_original_srt")
         s = time.time()
@@ -972,4 +1087,5 @@ if __name__ == "__main__":
         max_workers=args.jobs,
         filter_segments=args.filter_segments,
         fix_timestamps=not args.no_fix_timestamps,
+        raw_mode=args.raw_mode,
     )
