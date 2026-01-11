@@ -1,6 +1,7 @@
 import sys
 import argparse
 import json
+import re
 from tqdm.auto import tqdm
 import whisper
 from pathlib import Path
@@ -10,12 +11,94 @@ import time
 from loguru import logger
 
 
+def is_youtube_url(url: str) -> bool:
+    """Check if the given string is a YouTube URL."""
+    youtube_patterns = [
+        r'(https?://)?(www\.)?youtube\.com/watch\?v=[\w-]+',
+        r'(https?://)?(www\.)?youtube\.com/shorts/[\w-]+',
+        r'(https?://)?(www\.)?youtu\.be/[\w-]+',
+        r'(https?://)?(www\.)?youtube\.com/embed/[\w-]+',
+    ]
+    for pattern in youtube_patterns:
+        if re.match(pattern, url):
+            return True
+    return False
+
+
+def download_youtube_video(url: str, output_dir: str = "../data") -> tuple[str, str]:
+    """
+    Download a YouTube video using yt-dlp.
+    
+    Args:
+        url: YouTube video URL
+        output_dir: Base directory to save the downloaded video
+        
+    Returns:
+        Tuple of (path to the downloaded video file, path to the video's directory)
+    """
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        output_path.mkdir(parents=True)
+    
+    # First, get the video title to create directory
+    title_command = [
+        "yt-dlp",
+        "--restrict-filenames",
+        "--print", "%(title)s",
+        url
+    ]
+    
+    logger.info(f"Getting video title for: {url}")
+    title_result = subprocess.run(title_command, capture_output=True, text=True)
+    
+    if title_result.returncode != 0:
+        logger.error(f"yt-dlp stderr: {title_result.stderr}")
+        raise Exception(f"Failed to get video title. Return code: {title_result.returncode}")
+    
+    video_title = title_result.stdout.strip().split('\n')[-1]
+    
+    # Create video-specific directory
+    video_dir = output_path / video_title
+    if not video_dir.exists():
+        video_dir.mkdir(parents=True)
+    
+    # Download video to the video-specific directory
+    # -S "ext" sorts formats by extension preference (mp4 preferred)
+    # --restrict-filenames replaces spaces and special chars with underscores
+    command = [
+        "yt-dlp",
+        "-S", "ext",
+        "--restrict-filenames",
+        "-o", str(video_dir / "%(title)s.%(ext)s"),
+        "--print", "after_move:filepath",
+        url
+    ]
+    
+    logger.info(f"Downloading YouTube video: {url}")
+    logger.info(f"Command: {' '.join(command)}")
+    
+    result = subprocess.run(command, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        logger.error(f"yt-dlp stderr: {result.stderr}")
+        raise Exception(f"Failed to download YouTube video. Return code: {result.returncode}")
+    
+    # The last line of stdout contains the downloaded file path
+    downloaded_file = result.stdout.strip().split('\n')[-1]
+    
+    if not Path(downloaded_file).exists():
+        raise FileNotFoundError(f"Downloaded file not found: {downloaded_file}")
+    
+    logger.info(f"Downloaded video to: {downloaded_file}")
+    return downloaded_file, str(video_dir)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate and embed subtitle to the video.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("video", help="The video file.")
+    parser.add_argument("video", help="The video file path or YouTube URL.")
     parser.add_argument("--lang", help="The main language in video.")
     parser.add_argument("--todir", default="../data/", help="The result video dir.")
     parser.add_argument("--stt_model", default="small", help="The STT model.")
@@ -28,6 +111,50 @@ def parse_args():
         "--soft-sub",
         action="store_true",
         help="Use soft subtitles (mov_text) instead of burning them into video. Default is burn-in for better compatibility.",
+    )
+    parser.add_argument(
+        "-M", "--no-merge",
+        action="store_true",
+        dest="no_merge_segments",
+        help="Disable merging of short subtitle segments.",
+    )
+    parser.add_argument(
+        "-w", "--min-words",
+        type=int,
+        default=3,
+        help="Minimum words per segment.",
+    )
+    parser.add_argument(
+        "-d", "--min-dur",
+        type=float,
+        default=1.0,
+        dest="min_duration",
+        help="Minimum duration (seconds) per segment.",
+    )
+    parser.add_argument(
+        "-D", "--max-dur",
+        type=float,
+        default=10.0,
+        dest="max_duration",
+        help="Maximum duration (seconds) for merged segment.",
+    )
+    parser.add_argument(
+        "-j", "--jobs",
+        type=int,
+        default=4,
+        help="Number of parallel workers for translation (1=sequential).",
+    )
+    parser.add_argument(
+        "-F", "--filter",
+        action="store_true",
+        dest="filter_segments",
+        help="Enable filtering of anomalous segments (experimental).",
+    )
+    parser.add_argument(
+        "--no-fix-ts",
+        action="store_true",
+        dest="no_fix_timestamps",
+        help="Disable automatic fixing of anomalous timestamps.",
     )
     return parser.parse_args()
 
@@ -68,6 +195,337 @@ def stt(audio, lang=None, todir=None) -> str | Path:
     return tofile
 
 
+def fix_timestamp_anomalies(transcribe_res_file, max_wps=5.0, min_wps=1.0):
+    """
+    Fix segments with anomalous timing by adjusting timestamps.
+    
+    When Whisper assigns wrong timestamps (e.g., speech assigned to silent periods),
+    this function adjusts the timing to be more reasonable based on text length.
+    
+    The key insight: if a segment has very low WPS (words per second), the start time
+    is likely wrong. We can estimate a more reasonable start time by:
+    - Calculating expected duration based on typical speech rate
+    - Moving the start time closer to the end time
+    
+    Args:
+        transcribe_res_file: Path to the transcription JSON file
+        max_wps: Maximum expected words per second for normal speech
+        min_wps: Minimum expected words per second for normal speech
+        
+    Returns:
+        Path to the fixed transcription JSON file
+    """
+    tofile = Path(transcribe_res_file).parent / f"{Path(transcribe_res_file).stem}_fixed.json"
+    if tofile.exists():
+        logger.warning(f"Fixed transcription file {tofile} already exists, skipping fix.")
+        return str(tofile)
+    
+    with open(transcribe_res_file, "r", encoding="utf8") as f:
+        transcribe_res = json.load(f)
+    
+    segments = transcribe_res["segments"]
+    if not segments:
+        return transcribe_res_file
+    
+    fixed_segments = []
+    fix_count = 0
+    
+    # Target WPS for estimating correct duration (typical speech rate)
+    target_wps = 2.5
+    
+    for seg in segments:
+        duration = seg["end"] - seg["start"]
+        text = seg["text"].strip()
+        words = len(text.split())
+        
+        if duration < 0.1 or words == 0:
+            fixed_segments.append(seg.copy())
+            continue
+        
+        wps = words / duration
+        
+        # Check if timing is anomalous (WPS too low = duration too long for text)
+        if wps < min_wps and duration > 5:
+            # Calculate expected duration based on typical speech rate
+            expected_duration = words / target_wps
+            expected_duration = max(expected_duration, 1.0)  # At least 1 second
+            expected_duration = min(expected_duration, 10.0)  # At most 10 seconds
+            
+            # Adjust start time (keep end time, move start closer to end)
+            new_start = seg["end"] - expected_duration
+            
+            old_start = seg["start"]
+            new_seg = seg.copy()
+            new_seg["start"] = new_start
+            fixed_segments.append(new_seg)
+            
+            fix_count += 1
+            logger.warning(
+                f"Fixed timestamp [{seg['id']}]: {old_start:.1f}-{seg['end']:.1f} -> "
+                f"{new_start:.1f}-{seg['end']:.1f} (WPS: {wps:.2f} -> {words/expected_duration:.2f}) "
+                f"- \"{text[:40]}...\""
+            )
+        else:
+            fixed_segments.append(seg.copy())
+    
+    # Create fixed result
+    fixed_result = {
+        "text": transcribe_res.get("text", ""),
+        "segments": fixed_segments,
+        "language": transcribe_res.get("language", ""),
+    }
+    
+    with open(tofile, "w", encoding="utf8") as f:
+        json.dump(fixed_result, f, ensure_ascii=False, indent=4)
+    
+    logger.info(f"Fixed {fix_count} segments with anomalous timestamps. Saved to {tofile}")
+    return str(tofile)
+
+
+def filter_anomalous_segments(transcribe_res_file, min_wps=0.8, max_wps=8.0):
+    """
+    Filter out segments with anomalous timing (likely STT errors or movie dialogue).
+    
+    This helps remove segments where:
+    - Text is assigned to wrong time spans (e.g., speech during movie playback)
+    - Duration is way too long/short for the amount of text
+    - Likely movie dialogue picked up instead of narrator speech
+    
+    Args:
+        transcribe_res_file: Path to the transcription JSON file
+        min_wps: Minimum words per second (below this, timing is suspicious)
+        max_wps: Maximum words per second (above this, timing is suspicious)
+        
+    Returns:
+        Path to the filtered transcription JSON file
+    """
+    tofile = Path(transcribe_res_file).parent / f"{Path(transcribe_res_file).stem}_filtered.json"
+    if tofile.exists():
+        logger.warning(f"Filtered transcription file {tofile} already exists, skipping filter.")
+        return str(tofile)
+    
+    with open(transcribe_res_file, "r", encoding="utf8") as f:
+        transcribe_res = json.load(f)
+    
+    segments = transcribe_res["segments"]
+    if not segments:
+        return transcribe_res_file
+    
+    filtered_segments = []
+    removed_count = 0
+    
+    for seg in segments:
+        duration = seg["end"] - seg["start"]
+        text = seg["text"].strip()
+        words = len(text.split())
+        
+        if duration < 0.1:
+            # Too short duration, skip
+            removed_count += 1
+            logger.debug(f"Removed segment {seg['id']}: duration too short ({duration:.2f}s)")
+            continue
+        
+        wps = words / duration
+        
+        # Check for anomalies
+        is_anomalous = False
+        reason = ""
+        
+        # Very long duration with few words (likely wrong timing)
+        if duration > 15 and words <= 5:
+            is_anomalous = True
+            reason = f"long duration ({duration:.1f}s) with few words ({words})"
+        
+        # Very short segments with low WPS - likely movie dialogue picked up
+        # These are often single words or short phrases during movie playback
+        # Only filter if: duration >= 1.5s, words <= 3, and wps < 0.8
+        elif duration >= 1.5 and words <= 3 and wps < 0.8:
+            is_anomalous = True
+            reason = f"short phrase with low WPS ({wps:.2f}) - likely movie dialogue"
+        
+        # WPS way too high (duration too short for text)
+        elif wps > max_wps and words > 3:
+            is_anomalous = True
+            reason = f"high WPS ({wps:.2f})"
+        
+        if is_anomalous:
+            removed_count += 1
+            logger.warning(f"Removed anomalous segment [{seg['id']}] {seg['start']:.1f}-{seg['end']:.1f}: {reason} - \"{text[:40]}...\"")
+        else:
+            filtered_segments.append(seg)
+    
+    # Re-index segments
+    for i, seg in enumerate(filtered_segments):
+        seg["id"] = i
+    
+    # Create filtered result
+    filtered_result = {
+        "text": transcribe_res.get("text", ""),
+        "segments": filtered_segments,
+        "language": transcribe_res.get("language", ""),
+    }
+    
+    with open(tofile, "w", encoding="utf8") as f:
+        json.dump(filtered_result, f, ensure_ascii=False, indent=4)
+    
+    logger.info(f"Filtered {removed_count} anomalous segments. {len(filtered_segments)} segments remaining. Saved to {tofile}")
+    return str(tofile)
+
+
+def merge_short_segments(transcribe_res_file, min_words=3, min_duration=1.0, max_duration=10.0, max_words=30):
+    """
+    Merge short subtitle segments into longer, more complete sentences.
+    
+    This post-processing step combines short segments (like single words or brief phrases)
+    into more natural, readable subtitle blocks while respecting timing constraints.
+    
+    Args:
+        transcribe_res_file: Path to the transcription JSON file
+        min_words: Minimum number of words per segment (segments shorter than this will be merged)
+        min_duration: Minimum duration in seconds for a segment
+        max_duration: Maximum duration in seconds for a merged segment
+        max_words: Maximum number of words in a merged segment
+        
+    Returns:
+        Path to the merged transcription JSON file
+    """
+    tofile = Path(transcribe_res_file).parent / f"{Path(transcribe_res_file).stem}_merged.json"
+    if tofile.exists():
+        logger.warning(f"Merged transcription file {tofile} already exists, skipping merge.")
+        return str(tofile)
+    
+    with open(transcribe_res_file, "r", encoding="utf8") as f:
+        transcribe_res = json.load(f)
+    
+    segments = transcribe_res["segments"]
+    if not segments:
+        return transcribe_res_file
+    
+    # Words that indicate an incomplete sentence if they appear at the end
+    # These are typically prepositions, articles, conjunctions, possessive pronouns etc.
+    incomplete_endings = {
+        'a', 'an', 'the', 'and', 'or', 'but', 'if', 'so', 'as', 'at', 'by', 'for', 
+        'in', 'of', 'on', 'to', 'with', 'from', 'into', 'like', 'his', 'her', 'its',
+        'their', 'my', 'your', 'our', 'that', 'which', 'who', 'whom', 'whose', 'this',
+        'these', 'those', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have',
+        'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may',
+        'might', 'must', 'can', "it's", "he's", "she's", "we're", "they're", "I'm",
+        "you're", "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't",
+    }
+    
+    def ends_with_incomplete(text):
+        """Check if text ends with a word that suggests an incomplete sentence."""
+        text = text.strip()
+        if not text:
+            return False
+        
+        # First check: if the text doesn't end with sentence-ending punctuation,
+        # it's likely an incomplete sentence (unless it's a very short phrase)
+        words = text.split()
+        if len(words) >= 3 and not text[-1] in '.!?':
+            return True
+        
+        # Second check: specific words that indicate incomplete sentence
+        last_word = words[-1].lower().rstrip('.,!?:;')
+        return last_word in incomplete_endings
+    
+    merged_segments = []
+    current_segment = None
+    
+    for segment in segments:
+        text = segment["text"].strip()
+        word_count = len(text.split())
+        duration = segment["end"] - segment["start"]
+        
+        if current_segment is None:
+            # Start a new segment
+            current_segment = {
+                "id": len(merged_segments),
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": text,
+            }
+        else:
+            # Check if we should merge with current segment
+            current_text = current_segment["text"]
+            current_word_count = len(current_text.split())
+            current_duration = current_segment["end"] - current_segment["start"]
+            potential_duration = segment["end"] - current_segment["start"]
+            potential_word_count = current_word_count + word_count
+            
+            # Decide whether to merge
+            should_merge = False
+            
+            # Merge if current segment is too short (words or duration)
+            if current_word_count < min_words or current_duration < min_duration:
+                should_merge = True
+            
+            # Merge if new segment is too short
+            if word_count < min_words or duration < min_duration:
+                should_merge = True
+            
+            # Check if current segment ends with an incomplete sentence indicator
+            is_incomplete = ends_with_incomplete(current_text)
+            if is_incomplete:
+                should_merge = True
+            
+            # Don't merge if result would be too long
+            # Use strict limits to keep subtitles readable (aim for ~2 lines max)
+            hard_max_duration = 7.0   # Absolute max duration regardless of conditions
+            hard_max_words = 20       # Absolute max words regardless of conditions
+            
+            if is_incomplete:
+                # For incomplete sentences, only slightly relaxed limits
+                soft_max_duration = min(max_duration * 1.05, hard_max_duration)
+                soft_max_words = min(int(max_words * 1.05), hard_max_words)
+                if potential_duration > soft_max_duration or potential_word_count > soft_max_words:
+                    should_merge = False
+                    logger.debug(f"Incomplete sentence not merged due to length: {current_text[:50]}...")
+            else:
+                if potential_duration > max_duration or potential_word_count > max_words:
+                    should_merge = False
+            
+            # Don't merge if there's a long gap between segments (> 1.5 seconds)
+            gap = segment["start"] - current_segment["end"]
+            if gap > 1.5:
+                should_merge = False
+            
+            if should_merge:
+                # Merge: extend current segment
+                current_segment["end"] = segment["end"]
+                current_segment["text"] = current_text + " " + text
+            else:
+                # Finalize current segment and start new one
+                merged_segments.append(current_segment)
+                current_segment = {
+                    "id": len(merged_segments),
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "text": text,
+                }
+    
+    # Don't forget the last segment
+    if current_segment is not None:
+        merged_segments.append(current_segment)
+    
+    # Update IDs
+    for i, seg in enumerate(merged_segments):
+        seg["id"] = i
+    
+    # Create new transcription result
+    merged_result = {
+        "text": transcribe_res.get("text", ""),
+        "segments": merged_segments,
+        "language": transcribe_res.get("language", ""),
+    }
+    
+    with open(tofile, "w", encoding="utf8") as f:
+        json.dump(merged_result, f, ensure_ascii=False, indent=4)
+    
+    logger.info(f"Merged {len(segments)} segments into {len(merged_segments)} segments. Saved to {tofile}")
+    return str(tofile)
+
+
 def save_original_srt(transcribe_res_file):
     """Save the original language SRT subtitle file from transcription JSON."""
     tofile = Path(transcribe_res_file).parent / f"{Path(transcribe_res_file).stem}.srt"
@@ -97,7 +555,7 @@ def save_original_srt(transcribe_res_file):
     return str(tofile)
 
 
-def translate(transcribe_res_file, tgtlang="中文", model="gpt-4o", timeout=5 * 60):
+def translate(transcribe_res_file, tgtlang="中文", model="gpt-4o", timeout=5 * 60, max_workers=4):
     tofile = (
         Path(transcribe_res_file).parent
         / f"{Path(transcribe_res_file).stem}_{tgtlang}.srt"
@@ -125,7 +583,7 @@ def translate(transcribe_res_file, tgtlang="中文", model="gpt-4o", timeout=5 *
         }
         index2text[idx] = item["text"].strip()
     
-    translated = ask_llm(transcribe_res, tgtlang=tgtlang, model=model, timeout=timeout)
+    translated = ask_llm(transcribe_res, tgtlang=tgtlang, model=model, timeout=timeout, max_workers=max_workers)
     
     # Build translation map for quick lookup
     translation_map = {item.index: item.translation.strip() for item in translated.translations}
@@ -291,6 +749,13 @@ def main(
     tgtlang=True,
     trans_model="gpt-4o",
     burn_in=True,
+    merge_segments=True,
+    min_words=3,
+    min_duration=1.0,
+    max_duration=10.0,
+    max_workers=4,
+    filter_segments=False,
+    fix_timestamps=True,
 ) -> str | Path:
     original_srt = None
     if not srt:
@@ -302,6 +767,29 @@ def main(
         s = time.time()
         transcribe_res = stt(audio, lang=lang, todir=todir)
         logger.info(f"Done stt, {time.time() - s:.4f} s.")
+        # Fix anomalous timestamps
+        if fix_timestamps:
+            logger.info(f"Start fix_timestamp_anomalies")
+            s = time.time()
+            transcribe_res = fix_timestamp_anomalies(transcribe_res)
+            logger.info(f"Done fix_timestamp_anomalies, {time.time() - s:.4f} s.")
+        # Filter anomalous segments (optional)
+        if filter_segments:
+            logger.info(f"Start filter_anomalous_segments")
+            s = time.time()
+            transcribe_res = filter_anomalous_segments(transcribe_res)
+            logger.info(f"Done filter_anomalous_segments, {time.time() - s:.4f} s.")
+        # Merge short segments
+        if merge_segments:
+            logger.info(f"Start merge_short_segments")
+            s = time.time()
+            transcribe_res = merge_short_segments(
+                transcribe_res,
+                min_words=min_words,
+                min_duration=min_duration,
+                max_duration=max_duration,
+            )
+            logger.info(f"Done merge_short_segments, {time.time() - s:.4f} s.")
         # Save original language SRT
         logger.info(f"Start save_original_srt")
         s = time.time()
@@ -316,7 +804,7 @@ def main(
     if tgtlang:
         logger.info(f"Start translate")
         s = time.time()
-        srt = translate(transcribe_res, tgtlang=tgtlang, model=trans_model)
+        srt = translate(transcribe_res, tgtlang=tgtlang, model=trans_model, max_workers=max_workers)
         logger.info(f"Done translate, {time.time() - s:.4f} s.")
     logger.info(f"Start adjust")
     s = time.time()
@@ -331,6 +819,27 @@ def main(
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Check if input is a YouTube URL
+    video_path = args.video
+    todir = args.todir
+    if is_youtube_url(args.video):
+        logger.info(f"Detected YouTube URL: {args.video}")
+        video_path, todir = download_youtube_video(args.video, output_dir=args.todir)
+        logger.info(f"YouTube video downloaded to: {video_path}")
+        logger.info(f"Working directory: {todir}")
+    else:
+        # Local video file: create a directory based on video name
+        video_file = Path(args.video)
+        if video_file.exists():
+            video_name = video_file.stem  # filename without extension
+            base_dir = Path(args.todir) if args.todir else video_file.parent
+            video_dir = base_dir / video_name
+            if not video_dir.exists():
+                video_dir.mkdir(parents=True)
+            todir = str(video_dir)
+            logger.info(f"Created working directory for local video: {todir}")
+    
     if not args.srt:
         if args.stt_model == "small":
             modelpath = "stt_models/whisper/small.pt"
@@ -348,11 +857,18 @@ if __name__ == "__main__":
             f"Loaded STT model {args.stt_model} from {modelpath}, device={device}."
         )
     main(
-        args.video,
+        video_path,
         args.lang,
-        args.todir,
+        todir,
         args.srt,
         args.tgtlang,
         args.trans_model,
         burn_in=not args.soft_sub,
+        merge_segments=not args.no_merge_segments,
+        min_words=args.min_words,
+        min_duration=args.min_duration,
+        max_duration=args.max_duration,
+        max_workers=args.jobs,
+        filter_segments=args.filter_segments,
+        fix_timestamps=not args.no_fix_timestamps,
     )
